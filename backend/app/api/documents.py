@@ -1,0 +1,226 @@
+"""Document generation API routes."""
+
+import json
+import uuid
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, status
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+
+from app.core.database import get_db
+from app.models.template import Template, TemplateStatus
+from app.models.document import Document, DocumentStatus
+from app.models.task import BatchTask, BatchTaskStatus, BatchTaskItem
+from app.models.user import User
+from app.api.deps import get_current_user
+from app.services.storage import document_storage, import_storage, template_storage
+from app.core.config import settings
+from engine.app.core.renderer import generate_document, detect_unresolved_placeholders
+from engine.app.core.html_renderer import render_to_html
+
+router = APIRouter(prefix="/api/documents", tags=["documents"])
+
+
+class GenerateRequest(BaseModel):
+    template_id: str
+    title: str | None = None
+    variables: dict
+
+
+class SaveDraftRequest(BaseModel):
+    template_id: str
+    title: str | None = None
+    variables: dict
+    document_id: str | None = None
+
+
+@router.post("/drafts")
+def save_draft(
+    req: SaveDraftRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Save document as draft (without generating the actual file)."""
+    if req.document_id:
+        doc = db.query(Document).filter(Document.id == req.document_id, Document.created_by == current_user.id).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="草稿不存在")
+        doc.variable_values = req.variables
+        if req.title:
+            doc.title = req.title
+        doc.updated_at = datetime.utcnow()
+        db.commit()
+        return {"id": str(doc.id), "status": "draft_updated"}
+    else:
+        doc = Document(
+            title=req.title or f"草稿_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
+            template_id=req.template_id,
+            template_version=1,
+            status=DocumentStatus.DRAFT,
+            variable_values=req.variables,
+            created_by=current_user.id,
+        )
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+        return {"id": str(doc.id), "status": "draft_created"}
+
+
+@router.post("/generate")
+def generate_single_document(
+    req: GenerateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Generate a single document from a template."""
+    template = db.query(Template).filter(Template.id == req.template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    if template.status != TemplateStatus.PUBLISHED:
+        raise HTTPException(status_code=400, detail="模板未发布")
+
+    # Generate document
+    template_full_path = template_storage.get_full_path(template.file_path)
+    output_filename = f"{uuid.uuid4().hex}.docx"
+    output_rel_path = document_storage.save("", output_filename, b"")
+
+    # Generate the actual document
+    output_full_path = document_storage.get_full_path(output_rel_path)
+    generate_document(template_full_path, req.variables, output_full_path)
+
+    # Check for unresolved placeholders
+    unresolved = detect_unresolved_placeholders(output_full_path)
+
+    # Create document record
+    doc = Document(
+        title=req.title or f"文档_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
+        template_id=template.id,
+        template_version=template.current_version,
+        status=DocumentStatus.DRAFT,
+        variable_values=req.variables,
+        file_path=output_rel_path,
+        created_by=current_user.id,
+    )
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+
+    return {
+        "id": str(doc.id),
+        "title": doc.title,
+        "status": doc.status.value,
+        "unresolved_placeholders": unresolved,
+    }
+
+
+@router.get("/{document_id}")
+def get_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get document details."""
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    return doc
+
+
+@router.get("/{document_id}/preview")
+def preview_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get HTML preview of a document."""
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc or not doc.file_path:
+        raise HTTPException(status_code=404, detail="文档不存在或未生成")
+
+    full_path = document_storage.get_full_path(doc.file_path)
+    html = render_to_html(full_path)
+    return {"html": html}
+
+
+@router.get("/{document_id}/export/word")
+def export_word(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Export document as Word (.docx) file."""
+    from fastapi.responses import FileResponse
+
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc or not doc.file_path:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    full_path = document_storage.get_full_path(doc.file_path)
+    return FileResponse(
+        full_path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=f"{doc.title or 'document'}.docx",
+    )
+
+
+@router.get("/{document_id}/export/pdf")
+def export_pdf(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Export document as PDF."""
+    from fastapi.responses import FileResponse
+
+    from engine.app.core.pdf_converter import convert_to_pdf
+
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc or not doc.file_path:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    docx_path = document_storage.get_full_path(doc.file_path)
+
+    import tempfile
+    import os
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            pdf_path = convert_to_pdf(docx_path, tmpdir)
+            filename = f"{doc.title or 'document'}.pdf"
+            return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"PDF 转换失败: {str(e)}")
+
+
+@router.post("/export/batch-zip")
+def batch_export_zip(
+    document_ids: list[str],
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Export multiple documents as a ZIP package."""
+    import zipfile
+    import io
+    from fastapi.responses import StreamingResponse
+
+    documents = db.query(Document).filter(
+        Document.id.in_(document_ids),
+        Document.created_by == current_user.id,
+        Document.file_path.isnot(None),
+    ).all()
+
+    if not documents:
+        raise HTTPException(status_code=404, detail="未找到可导出的文档")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for doc in documents:
+            full_path = document_storage.get_full_path(doc.file_path)
+            arcname = f"{doc.title or 'document'}.docx"
+            zf.write(full_path, arcname)
+
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=documents_{datetime.utcnow().strftime('%Y%m%d')}.zip"},
+    )

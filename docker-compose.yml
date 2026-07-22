@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: docflow
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  libreoffice:
+    image: lscr.io/linuxserver/libreoffice:latest
+    environment:
+      PUID: 1000
+      PGID: 1000
+    ports:
+      - "8100:8100"
+    command: ["--headless", "--accept=socket,host=0,port=8100;urp;"]
+
+volumes:
+  pgdata:
