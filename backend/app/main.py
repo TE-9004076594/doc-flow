@@ -1,5 +1,6 @@
 '''FastAPI application entry point.'''
 
+import logging
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,6 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.database import engine, Base
+
+# Configure logging for docflow modules
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # Add project root to path for cross-module imports (engine)
 project_root = Path(__file__).resolve().parent.parent.parent
